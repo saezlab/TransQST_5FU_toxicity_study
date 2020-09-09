@@ -1,0 +1,413 @@
+---
+title: "VIPER tests and hack for comparable samples"
+author: "A. Gabor"
+date: "8/19/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(biomaRt)
+library(tidyverse)
+#BiocManager::install("dorothea")
+library(dorothea)
+library(here)
+```
+
+## Data
+Here we just import data: transcriptomics of colon and small intestine, treated with the drug 5-FU. 
+Measurements are taken 0, 24 and 72h after treatment with 10, 100 and 1000 uM. 
+Then log2FC are calculated for each gene. 
+
+```{r import, message=FALSE, warning=FALSE, include=FALSE}
+# SI transciptomics data: 
+SI_data <- read_rds(here("./data/5-FU in vitro human/transcriptomics/SI/SI_transcriptomics_diffExp_filtered_data.rds")) %>%
+	add_column(organ = "SI")
+# Colon transciptomics data: 
+Colon_data <- read_rds(here("./data/5-FU in vitro human/transcriptomics/colon/colon_transcriptomics_diffExp_filtered_data.rds")) %>%
+	add_column(organ = "colon")
+
+transcriptomics_data <- bind_rows(SI_data,Colon_data) %>% mutate(sample_id = paste0(organ,"_",fileID))
+
+```
+```{r}
+summary(transcriptomics_data)
+```
+
+
+```{r include=FALSE}
+# load dorothea regulons with the standard ABC confidence levels: 
+regulons <- dorothea_hs %>%
+  dplyr::filter(confidence %in% c("A", "B","C"))
+# download mart
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+genes_dic <- getBM(  attributes=c("hgnc_symbol","ensembl_gene_id"), # "entrezgene_id"
+  mart = mart)
+
+transcriptomics_data <- transcriptomics_data %>%
+	left_join(genes_dic, by = "ensembl_gene_id")
+
+dorothea_data = transcriptomics_data %>%
+	filter(!is.na(hgnc_symbol)) %>%
+	filter(nchar(hgnc_symbol)!=0)
+
+# we take the mean log2FC for these
+dorothea_data_hgnc <- dorothea_data %>% 
+	group_by(sample_id,hgnc_symbol) %>%
+	summarise(log2FC = mean(log2FoldChange)) %>%
+	ungroup()
+
+```
+
+## Viper tests
+
+#### VIPER is deterministic (runs are identical)
+- test if results are deterministic (multiple runs and comparison)
+```{r}
+viper_input = dorothea_data_hgnc  %>%
+	spread(sample_id,log2FC) %>%
+	column_to_rownames("hgnc_symbol")
+
+tf_activities_stat_1 <- dorothea::run_viper(viper_input, regulons,
+    options =  list(minsize = 5, eset.filter = FALSE, 
+    cores = 1, verbose = FALSE, nes = TRUE),)
+
+tf_activities_stat_2 <- dorothea::run_viper(viper_input, regulons,
+    options =  list(minsize = 5, eset.filter = FALSE, 
+    cores = 1, verbose = FALSE, nes = TRUE),)
+
+all(tf_activities_stat_1 ==tf_activities_stat_2)
+
+```
+
+
+
+#### Sample independence
+
+check if removing/adding a column to data matrix changes the results.
+If columns are computed independently, results should not change
+
+```{r}
+viper_input = dorothea_data_hgnc  %>%
+	spread(sample_id,log2FC) %>%
+	column_to_rownames("hgnc_symbol")
+
+tf_activities_stat_col13 <- dorothea::run_viper(viper_input[1:3], regulons,
+    options =  list(minsize = 5, eset.filter = FALSE, 
+    cores = 1, verbose = FALSE, nes = TRUE),)
+
+
+tf_activities_stat_col19 <- dorothea::run_viper(viper_input[1:9], regulons,
+    options =  list(minsize = 5, eset.filter = FALSE, 
+    cores = 1, verbose = FALSE, nes = TRUE),)
+
+
+all(tf_activities_stat_col13 == tf_activities_stat_col19[,1:3])
+
+```
+
+
+TF activities computed based on 3 samples and based on 9 samples are the same for the overlapping samples. 
+Therefore samples (columns) are computed independently. 
+
+
+#### Scaling has no effect
+
+
+Does scaling the data influence results? 
+```{r}
+viper_input = dorothea_data_hgnc  %>%
+	spread(sample_id,log2FC) %>%
+	column_to_rownames("hgnc_symbol")
+
+tf_activities_stat_nominal <- dorothea::run_viper(viper_input, regulons,
+    options =  list(minsize = 5, eset.filter = FALSE, 
+    cores = 1, verbose = FALSE, nes = TRUE),)
+
+tf_activities_stat_scaled <- dorothea::run_viper(scale(viper_input), regulons,
+    options =  list(minsize = 5, eset.filter = FALSE, 
+    cores = 1, verbose = FALSE, nes = TRUE),)
+
+
+all(tf_activities_stat_nominal == tf_activities_stat_scaled)
+```
+
+#### Sample comparison
+
+
+```{r, fig.width=10,fig.height=12}
+viper_input = dorothea_data_hgnc  %>%
+	spread(sample_id,log2FC) %>%
+	column_to_rownames("hgnc_symbol")
+
+tf_activities_stat <- dorothea::run_viper(viper_input, regulons,
+    options =  list(minsize = 5, eset.filter = FALSE, 
+    cores = 1, verbose = FALSE, nes = TRUE),)
+
+
+tf_activities_stat <- tf_activities_stat %>%
+    as.data.frame() %>% 
+    rownames_to_column(var = "GeneID") %>%
+	gather(condition,NES,-GeneID) %>%
+    arrange(NES)
+```    
+
+
+#### Example: transcription factor ZNF263
+
+In my analysis, I would like to see how the TF activity goes in time and across dose. So let's plot how the NES evolves in the 2 organs: 
+```{r}
+NES_plot <- tf_activities_stat %>% filter(GeneID == "ZNF263") %>% 
+	separate(condition,into = c("organ","dose","time"),sep = "_") %>%
+	ggplot(aes(time,NES)) +
+	geom_point() + 
+	geom_line(aes(time,NES,group = organ)) + 
+	facet_grid(dose~organ)
+print(NES_plot)
+```
+
+Note:
+this way of plotting is already misleading (!), because it assumes, we can compare the values across samples.  
+I will show that this is not true. 
+
+Do the curves make sense? partially yes: 
+
+In colon: the higher the dose the stronger response we see in early time.
+However, the maximum of the NES is 10 across all concentrations in colon at 72 hours.
+This indicates, that the TF has the same activity in these conditions. But this is not true at all!
+
+
+To see this, the following figure shows the log2FC of the target genes ofZNF263:
+
+```{r}
+
+dorothea_data %>% 
+	mutate(target = hgnc_symbol) %>%
+	left_join(regulons,by = "target") %>%
+	filter(tf=="ZNF263") %>%
+	mutate(dose = paste0(concentration,"uM")) %>%
+	ggplot() + geom_point(aes(log2FoldChange,-log10(padj))) + facet_grid(dose ~ organ + time)
+
+```
+
+Clearly, the target genes are more down-regulated when higher dose was applied.
+
+If we compare Colon, at 72 hours, 1000uM vs 10uM, the log2FC are very different of 
+the target genes, but the NES are around 10 in both cases. 
+
+This means that the NES cannot be compared between samples: the same NES can mean 
+almost no change in target genes or a very strong change. 
+
+Let's calculate a quantitative score for the transcription factor: 
+for this we summarise the changes of it's targets. Because the TF can inhibit/activate  
+transcription, we also account for the sign of the interaction. 
+So the score is the signed-corrected, average log2FC of the targets in each condition. 
+
+
+```{r}
+tf_score <- dorothea_data %>% 
+	mutate(target = hgnc_symbol) %>%
+	inner_join(regulons,by = "target") %>%
+	group_by(tf, organ, concentration,time) %>%
+	summarise(tf_score = mean(log2FoldChange*mor)) %>%
+	ungroup()
+
+```
+Let's compare the NES and the tf_score: 
+
+```{r, fig.width=8}
+tf_score_plot  = tf_score %>% filter(tf == "ZNF263") %>%
+	mutate(dose = paste0(concentration,"uM")) %>%
+	ggplot(aes(time,tf_score)) +
+	geom_point() + 
+	geom_line(aes(group = organ)) + 
+	facet_grid(dose~organ)
+
+cowplot::plot_grid(NES_plot,tf_score_plot )
+```
+
+The trends are similar, but notice, that a tf_score of 0.25 (colon, 10uM, 72h) and 
+a tf_score of 1.25 (colon, 1000uM, 72h)  are both have NES around 10!
+
+
+
+
+## Establishing a global null-distribution
+
+The problem with the NES is that VIPER is based on ranking in the respective sample.
+Therefore a geneset gets a score based on how the elements are ranked in a sample. 
+We could force Viper to rank the genes across **all** samples. This trick can be done by 
+extending each columns with all the samples. 
+
+This way when VIPER generates null-distributions where all the samples are included.
+
+
+```{r}
+# skip_one_merge
+#
+# returns a dataframe, where each column contains all, but the i-th column of
+# the data from the original dataframe  
+# input: data.frame
+#
+skip_one_merge <- function(df){
+	
+	dat = tibble()
+	
+	rb <- lapply(seq(ncol(df)),function(i){
+		tmp = tibble(col = unlist(df[,-i]))
+		colnames(tmp) = colnames(df)[i]
+		return(tmp)
+	} )
+	lrb <- bind_cols(rb) %>% as.data.frame()
+	
+	rownames(lrb) = paste(rep(rownames(df),ncol(df)-1), rep(1:(ncol(df)-1),each=nrow(df)),sep = "_")
+	return(lrb)
+}
+
+# data frame with the original data
+viper_input = dorothea_data_hgnc  %>%
+	spread(sample_id,log2FC) %>%
+	column_to_rownames("hgnc_symbol")
+
+# reference: each column contains all the expression data, therefore, when TFs are 
+# ranked by the log2FC of their targets, all samples are considered: 
+reference_log2fc = skip_one_merge(viper_input)
+
+
+# run viper: 
+viper_w_ref = bind_rows(viper_input,reference_log2fc)
+tf_activities_stat_w_ref <- dorothea::run_viper(viper_w_ref, regulons,
+    options =  list(minsize = 5, eset.filter = FALSE, 
+    cores = 1, verbose = FALSE, nes = TRUE),)
+
+global_tf_activities_stat <- tf_activities_stat_w_ref %>%
+    as.data.frame() %>% 
+    rownames_to_column(var = "GeneID") %>%
+	gather(condition,gNES,-GeneID) %>%
+    group_by(condition) %>%
+    arrange(gNES)
+```
+
+
+Let's compare the this new enrichment score that I call gNES with the old NES and tf_score: 
+
+```{r, fig.width=12}
+global_NES_plot <- global_tf_activities_stat %>%
+	filter(GeneID == "ZNF263") %>% 
+	separate(condition,into = c("organ","dose","time"),sep = "_") %>%
+	ggplot(aes(time,gNES)) +
+	geom_point() + 
+	geom_line(aes(group = organ)) + 
+	facet_grid(dose~organ)
+
+cowplot::plot_grid(NES_plot + ylim(-10,20) ,global_NES_plot, tf_score_plot,nrow = 1 )
+```
+
+
+Notice  the subtle differences: 
+
+in colon, 10uM, both NES and gNES reach a value of 10. However, in 1000 uM the gNES curve starts 
+at 15 and reaches 20 at 72 hours. 
+Also the difference between the 10uM and 1000uM conditions, that we see in the Vulcano plots above
+are visible in the gNES values (and was not based on the NES). 
+
+
+### Direct comparison NES/gNES vs tf_score: 
+
+```{r}
+
+tf_stats <- full_join(global_tf_activities_stat %>% rename(tf = GeneID),
+		  tf_activities_stat %>% rename(tf = GeneID),by = c("tf", "condition")) %>%
+			separate(condition,into = c("organ","concentration","time"),sep = "_") %>%
+			full_join(tf_score %>% mutate(time = paste0(time,"h"),
+										  concentration = paste0(concentration,"uM")),
+					  by = c("tf", "organ", "time","concentration"))
+
+```
+
+If we plot NES vs tf_score and gNES vs tf_score, it seems that NES saturates much earlier than 
+gNES.
+
+```{r}
+tf_stats %>% 
+	filter(tf == "ZNF263") %>% 
+	ggplot(aes(tf_score,NES)) + geom_point(aes(col = concentration,shape=time)) + facet_wrap(~organ)
+```
+```{r}
+tf_stats %>% 
+	filter(tf == "ZNF263") %>%
+	ggplot(aes(tf_score,gNES)) + geom_point(aes(col = concentration,shape=time)) + facet_wrap(~organ)
+```
+
+### All TFs
+
+We calculate the enrichment score as it was orignaly implemented in VIPER and 
+the globalised NER. 
+```{r}
+tf_score <- dorothea_data %>% 
+	mutate(target = hgnc_symbol) %>%
+	inner_join(regulons,by = "target") %>%
+	group_by(tf, organ, concentration,time) %>%
+	summarise(tf_score = mean(log2FoldChange*mor)) %>%
+	ungroup() %>% 
+	mutate(sample = paste(organ, paste0(concentration,"uM"),paste0(time,"h"),sep = "_"))
+
+tf_activities_stat <- dorothea::run_viper(viper_input, regulons, tidy = TRUE,
+    options =  list(minsize = 5, eset.filter = FALSE, 
+    cores = 1, verbose = FALSE, nes = TRUE)) %>%
+	rename(NES = activity)
+
+
+tf_activities_stat_global <- dorothea::run_gviper(viper_input, regulons, tidy = TRUE,
+    options =  list(minsize = 5, eset.filter = FALSE, 
+    cores = 1, verbose = FALSE, nes = TRUE)) %>%
+	rename(gNES = activity)
+
+
+tf_data <- left_join(tf_score,tf_activities_stat,by = c("tf","sample")) %>%
+	left_join(tf_activities_stat_global,by = c("tf","sample","confidence"))
+```
+
+
+There are `tf_data %>% filter(!is.na(NES)) %>% pull(tf) %>% unique() %>% length()` transcription
+factors. 
+```{r}
+tf_data %>%
+	filter(!is.na(NES)) %>% arrange(desc(NES))
+
+
+
+plots <- tf_data %>% 
+	group_by(tf) %>% 
+	nest() %>%
+	mutate(plots = map2(tf,data,function(tf_name,plt_data){
+		plt = plt_data %>% ggplot(aes(time,NES)) +
+			geom_point(aes(col="sample")) + 
+			geom_line(aes(group = organ,col="sample")) + 
+			geom_point(aes(time,gNES,col="global")) + 
+			geom_line(aes(time,gNES,col="global", group = organ)) + 
+			facet_grid(concentration~organ)	+ ggtitle(tf)
+		
+	})) %>% select(plots)
+	
+pdf(file = "./TF_comparison.pdf")
+plots$plots[1:5]
+
+dev.off()
+	
+
+tf_data %>% 
+	group_by(tf,organ) %>%
+	summarise(corr_tfscore_NES = cor(tf_score,NES),
+			  corr_tfscore_gNES = cor(tf_score,gNES),
+			  corr_NES_gNES = cor(gNES,NES)) %>%
+	gather(type,correlation,corr_tfscore_NES,corr_tfscore_gNES,corr_NES_gNES) %>%
+	ggplot() + 
+	geom_boxplot(aes(type,correlation )) + facet_wrap(~organ)
+```
+
+
+
+
+
+
