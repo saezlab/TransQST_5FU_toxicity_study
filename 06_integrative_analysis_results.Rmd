@@ -1,0 +1,81 @@
+---
+title: "Integrative analysis of colon and small intestine"
+author: "A. Gabor"
+date: "9/15/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+```
+
+
+
+```{r load_results_1, include=FALSE}
+meta_pkn <- read_csv(file = "./data/meta_prior_knowledge/meta_network_carnival_ready_exch_solved_fullomni_metfiltered.csv")
+meta_network_colon <-	read_rds("./data/carnival_inputs/meta_pkn_colon.rds")
+meta_network_si <-	read_rds("./data/carnival_inputs/meta_pkn_si.rds")
+metabolomics <- read_rds("./data/carnival_inputs/human_metabolomics_data.rds")
+metabolomics_raw <- read_rds("./data/5-FU in vitro human/metabolomics/raw_metabolomics_tidy.rds")
+transcriptomics <- 
+tf_activity <- read_rds("./data/carnival_inputs/human_tf_data.rds")
+rna_seq_colon <- read_rds("./data/5-FU in vitro human/transcriptomics/colon/colon_transcriptomics_diffExp_filtered_data.rds")
+rna_seq_si <- read_rds("./data/5-FU in vitro human/transcriptomics/SI/SI_transcriptomics_diffExp_filtered_data.rds")
+expressed_genes_SI <- read_rds("./data/carnival_inputs/expressed_genes_human_SI.rds")
+expressed_genes_colon <- read_rds("./data/carnival_inputs/expressed_genes_human_colon.rds")
+```
+
+
+## Overview of the results
+
+### Prior knowledge 
+
+#### Metabolites
+
+The general prior knowledge contains metabolites, metabolic enzymes, proteins, 
+kinases and phosphatases, transcription factors. The resources were collected from 
+OmnipathDB, STICHdb and RECON3D. The collection is part of the COSMOS package by
+Aurelien Dugourd. 
+
+
+```{r pressure, echo=FALSE}
+pkn_metabolites <- tibble(nodes = c(meta_pkn$source, meta_pkn$target)) %>%
+	filter(grepl("XMetab__",x = nodes)) %>%
+	mutate(nodes = gsub("__[a-z]__","",x = nodes)) %>% 
+	mutate(nodes = gsub("XMetab__","",x = nodes)) %>%
+	mutate(nodes = gsub("___","",x = nodes)) %>%
+	unique()
+
+pkn_metabolites_pubchem = pkn_metabolites %>% filter(grepl("^[0-9]+$",nodes))
+
+data_matabolites <- unique(metabolomics_raw$`PubChem ID`)
+
+metabolomics_raw %>% filter(`PubChem ID` %in% pkn_metabolites$nodes ) %>%
+	filter(`q-value (FDR)` < 0.05) %>% pull(`PubChem ID`) %>% unique() %>% length()
+
+```
+
+The prior knowledge contains `R nrow(pkn_metabolites)` unique metabolites across 
+multiple compartments. Only `R nrow(pkn_metabolites_pubchem)` metabolites has a
+pubChemID. The data contains `R length(data_matabolites)`  unique 
+metabolites with pubchemID and `R sum(data_matabolites %in% pkn_metabolites$nodes)`
+are included in the prior knowledge. 
+
+
+#### Gene expression
+
+For TF activity measurements
+```{r}
+proteins <- tibble(nodes = c(meta_pkn$source, meta_pkn$target)) %>%
+	filter(!grepl("XMetab__",x = nodes)) %>%
+	mutate(nodes = gsub("__[a-z]__","",x = nodes)) %>% 
+	mutate(nodes = gsub("XMetab__","",x = nodes)) %>%
+	mutate(nodes = gsub("___","",x = nodes)) %>%
+	unique()
+```
+
+
+
+
+

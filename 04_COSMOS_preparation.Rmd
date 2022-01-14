@@ -1,0 +1,271 @@
+---
+title: "COSMOS Analysis: data preparation for CARNIVAL"
+author: "A. Gabor"
+date: "9/9/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(edgeR)
+source("./cosmos.R")
+```
+
+## Metabolomics import
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+excel_sheet_to_tibble <- function(data_file,sample_id_range){
+	
+	# read only row 2 and 3: sample ID and the name of the statistics
+	read_sample_id <- readxl::read_xlsx(data_file,range = sample_id_range)
+	
+	sample_stat_table <- tibble(stat = unlist(read_sample_id[1,]), sample_id = colnames(read_sample_id))
+	
+	# read the real data and reshape
+	real_data <- readxl::read_xlsx(data_file,skip=2 )
+	
+	# reshape and fix namings
+	# stat variables have a strange naming convention, they have an integer value. 
+	# therefore we can match the sample id with the stat name based on this.
+	# in the next step we remove.
+	#
+	# the first 6 column contains information about the metabolite and not on the sample
+	metabolomics_data <- real_data %>% gather(stat,value,-1:-6) %>%
+		left_join(sample_stat_table,by="stat") %>%
+		mutate(stat = gsub(pattern = "[0-9]+$",replacement = "",stat)) %>%
+		mutate(sample_id = gsub(pattern = "\\.+[0-9]+$",replacement = "",sample_id)) %>%
+		spread(stat,value) 
+	
+}
+
+import_metabolomics <- function(){
+	
+	# read raw data of colon
+	data_file = "./data/5-FU in vitro human/metabolomics/human colon organoid supernatants/Differential analysis_treatment effect_UMST.xlsx"
+	sample_id_range = "G2:AG3"
+	
+	metabolomics_colon <- excel_sheet_to_tibble(data_file,sample_id_range)
+	
+	# read raw data of small intestine
+	data_file = "./data/5-FU in vitro human/metabolomics/human small intestine organoid supernatants/Differential analysis_treatment effect_BI.xlsx"
+	sample_id_range = "G2:BB3"
+	
+	metabolomics_si  <- excel_sheet_to_tibble(data_file,sample_id_range)
+	
+	all_metabolomics <- bind_rows(metabolomics_colon %>% add_column(organ = "colon"), 
+								  metabolomics_si %>% add_column(organ = "si")) %>%
+		mutate(sample_id = paste(organ,sample_id,sep = "_"))
+}
+```
+
+Import the metabolomics data: 
+
+```{r message=FALSE, warning=FALSE}
+if(FALSE){
+	metabolomics = import_metabolomics()
+	write_rds(metabolomics,"./data/5-FU in vitro human/metabolomics/raw_metabolomics_tidy.rds")
+}else(
+	metabolomics = read_rds("./data/5-FU in vitro human/metabolomics/raw_metabolomics_tidy.rds")
+)
+print(head(metabolomics,10))
+```
+
+## Subsetting metabolomics data to prior knowledge
+Import meta prior knowledge, built from Omnipath and metabolomics interaction. 
+```{r}
+meta_pkn <- read_csv(file = "./data/meta_prior_knowledge/meta_network_carnival_ready_exch_solved_fullomni_metfiltered.csv")
+```
+
+the pkn contains compartment information: not all reactions happen in all compartments.
+But we dont have this info in the data. We will assume that the measured metaolites 
+could appear in any compartment. Then we filter for the measurements that appear 
+in the prior knowledge. 
+
+```{r}
+cosmos_pubchem_id <- prepare_metabolomics_names(metabolomics$`PubChem ID`,meta_pkn)
+```
+```{r include=FALSE}
+total_ions = length(unique(metabolomics$`ion m/z`))
+total_pubchemid = length(unique(metabolomics$`PubChem ID`))
+total_metab_in_PKN = sum(unique(metabolomics$`PubChem ID`) %in% cosmos_pubchem_id$pubchemID)
+
+signif_changed_metabolites = metabolomics %>% 
+	filter(!is.na(`PubChem ID`)) %>% 
+	filter(`q-value (FDR)` < 0.05) %>% nrow()
+
+signif_changed_metabolites_in_pkn = metabolomics %>% 
+	filter(!is.na(`PubChem ID`)) %>% 
+	filter(`PubChem ID` %in% cosmos_pubchem_id$pubchemID) %>%
+	filter(`q-value (FDR)` < 0.05) %>% nrow()
+```
+In total `r total_ions` unique ions were identified across samples, `r total_pubchemid` 
+has a valid pubchemID that we used to map the data to prior knowledge.
+The `r total_pubchemid`  metabolites were significantly 
+changed in total `r signif_changed_metabolites` times across conditions (q-value < 0.05). 
+
+Finally, `r total_metab_in_PKN` unique metabolite can be found in the prior knowledge network, 
+they were found significant in total `r signif_changed_metabolites_in_pkn` times across all conditions. 
+
+
+```{r}
+# we attach the generated cosmosIDs and filter for data that is in PKN
+metabolomics_in_pkn <- metabolomics %>% rename(pubchemID = `PubChem ID`) %>%
+	right_join(cosmos_pubchem_id,by = "pubchemID")
+```
+```{r}
+write_rds(metabolomics_in_pkn,"data/carnival_inputs/human_metabolomics_data.rds")
+```
+
+
+
+## Subsetting Transcription factor data to PKN
+
+We estimated the transcription factor activity, now we adjust the names to COSMOS 
+and filter for TFS that appear in the PKN. 
+```{r message=FALSE, warning=FALSE}
+tf_activity <- read_rds("./data/results/tf_activity_gviper_all_human.rds")
+
+
+tf_activity <- tf_activity %>% 
+	mutate(cosmosID = gene_symbols_to_entrez(tf)) %>%
+	mutate(cosmosID = paste0("X",cosmosID))
+
+```
+
+Filter TFs that are not in prior knowledge network or which activity changed
+less than 1.96 (threshold for .95 percentile of normal distribution, two-sided).
+
+```{r}
+tf_in_pkn = tf_activity %>%
+	filter(abs(activity) > 1.96) %>%
+	filter(cosmosID %in% c(meta_pkn$source,meta_pkn$target))
+
+total_tf_estimated = length(unique(tf_activity$tf))
+total_tf_in_pkn = length(unique(tf_in_pkn$tf))
+```
+In total we had `r total_tf_estimated` estimated transcription factors and found
+`r total_tf_in_pkn` of them in the PKN with strong change. 
+
+
+```{r}
+write_rds(tf_in_pkn,"data/carnival_inputs/human_tf_data.rds")
+```
+
+
+
+## Subsetting prior knowledge based on expressed genes
+
+
+We remove the nodes from the prior knowledge network if the nodes is a gene, which 
+is not expressed in the tissue. 
+
+First we need to find the genes that are not expressed across samples. 
+
+```{r message=FALSE, warning=FALSE}
+sample_meta_SI <- read_tsv("./data/5-FU in vitro human/transcriptomics/SI/raw/metadata.txt")
+raw_count_human_SI <- read_tsv("./data/5-FU in vitro human/transcriptomics/SI/raw/gene_count.txt") %>%
+	dplyr::rename(gene_ensembl_id = X1)
+
+sample_meta_colon <- read_tsv("./data/5-FU in vitro human/transcriptomics/colon/raw/metadata.txt") %>%
+	dplyr::rename(name = "X1")
+raw_count_human_colon <- read_tsv("./data/5-FU in vitro human/transcriptomics/colon/raw/gene_expected_count.txt") %>%
+	dplyr::rename(gene_ensembl_id = "gene_id")
+
+
+# add entrez id
+raw_count_human_SI <- raw_count_human_SI %>%
+	mutate(entrezID = gene_ensembl_to_entrez(gene_ensembl_id)) %>%
+	dplyr::select(gene_ensembl_id,entrezID,everything())
+
+raw_count_human_colon <- raw_count_human_colon %>%
+	mutate(entrezID = gene_ensembl_to_entrez(gene_ensembl_id)) %>%
+	dplyr::select(gene_ensembl_id,entrezID,everything())
+
+
+
+# identify genes to keep: 
+keep_SI <- find_unexpressed_genes(raw_count_human_SI[,-1:-2], sample_meta_SI)
+keep_colon <- find_unexpressed_genes(raw_count_human_colon[,-1:-2], sample_meta_colon)
+
+# merge to data
+raw_count_human_SI <- raw_count_human_SI %>%
+	add_column(keep = keep_SI, .before = 3)
+raw_count_human_colon <- raw_count_human_colon %>% 
+	add_column(keep = keep_colon, .before = 3)
+
+if(FALSE){
+	
+	write_rds(raw_count_human_SI[,1:3], "./data/carnival_inputs/expressed_genes_human_SI.rds")
+	write_rds(raw_count_human_colon[,1:3], "./data/carnival_inputs/expressed_genes_human_colon.rds")
+}
+
+
+```
+
+We compute the distribution of gene expression and show which part is removed. 
+```{r}
+raw_count_human_SI %>% 
+	gather(sample,count,starts_with("Sample_")) %>%
+	group_by(entrezID, keep) %>%
+	summarise(mean_count = mean(count)) %>%
+	ggplot() + geom_histogram(aes(log10(mean_count+0.1), fill=keep))
+
+raw_count_human_colon %>% 
+	gather(sample,count,starts_with("Sample_")) %>%
+	group_by(entrezID, keep) %>%
+	summarise(mean_count = mean(count)) %>%
+	ggplot() + geom_histogram(aes(log10(mean_count+0.1), fill=keep))
+```
+
+In the next step we remove from the prior knowledge the genes that we dont keep.
+This will result a PKN for colon and SI separately
+
+```{r}
+expressed_genes_SI <- raw_count_human_SI %>% 
+	filter(keep_SI) %>%
+	pull(entrezID)
+
+meta_pkn_si <- filter_pkn_expressed_genes(expressed_genes_entrez = expressed_genes_SI,
+										  meta_pkn = meta_pkn)
+
+
+expressed_genes_colon <- raw_count_human_colon %>% 
+	filter(keep_colon) %>%
+	pull(entrezID)
+
+meta_pkn_colon <- filter_pkn_expressed_genes(expressed_genes_entrez = expressed_genes_colon,
+											 meta_pkn = meta_pkn)
+```
+
+
+stats:
+```{r}
+nodes_original_pkn = unique(c(meta_pkn$source, meta_pkn$target))
+nodes_si_pkn =  unique(c(meta_pkn_si$source, meta_pkn_si$target)) 
+nodes_colon_pkn =  unique(c(meta_pkn_colon$source, meta_pkn_colon$target)) 
+
+# original
+nrow(meta_pkn)
+length(nodes_original_pkn)
+
+# colon: 
+nrow(meta_pkn_colon)
+length(nodes_colon_pkn)
+
+# SI:
+nrow(meta_pkn_si)
+length(nodes_si_pkn)
+```
+
+
+
+save results to files
+```{r}
+write_rds(meta_pkn_si,"./data/carnival_inputs/meta_pkn_si.rds")
+write_rds(meta_pkn_colon,"./data/carnival_inputs/meta_pkn_colon.rds")
+```
+
+
+

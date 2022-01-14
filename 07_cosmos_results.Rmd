@@ -1,0 +1,1007 @@
+---
+title: "COSMOS results of SI and Colon samples"
+author: "A. Gabor"
+date: "11/30/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Here we present the results of the integrated omics analysis using COSMOS. 
+COSMOS integrates transcriptomics and metabolomics data using prior knowledge. 
+This prior knowledge is a network, where nodes represent metabolites and proteins
+(e.g. kinases and metabolic enzymes) and signed, directed edges represent interactions
+among these entities. COSMOS builds on an optimization framework, that finds a subset 
+of the original prior knowledge network that is in agreement with the data.
+
+We estimated transcription factor activity from the transcriptomics data using 
+Dorothea regulon and Viper algorithm. The TF activity served as input nodes for COSMOS.
+Then we defined the measured metabolites that changed significantly as outputs.
+
+To explore multiple possible solutions for each samples, we (1) set in each COSMOS run to report 
+multiple solutions within the given time limit (15 hours) and (2) we rerun the optimization 10 times
+with shuffled inputs.
+
+Here we summarise the obtained results. 
+
+
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#library(cosmos)
+library(here)
+library(tidyverse)
+source("./parse_CPLEX_log.R")
+source("./format_cosmos_results_new.R")
+
+
+clean_run = FALSE
+```
+
+
+```{r include=FALSE}
+# The following samples were used for data integration because there the significant
+# number of metabolites were more than 3. 
+
+keep_sample  = c("colon_1000uM_24h", "colon_1000uM_48h",
+				 "colon_1000uM_72h", "colon_100uM_24h",
+				 "si_1000uM_24h",    "si_1000uM_48h",
+				 "si_1000uM_72h")
+samples = tibble(sample = keep_sample, sample_id = as.character(1:length(keep_sample)))
+
+# read in metabolites names: 
+# from the experiments: 
+metabolomics <- read_rds("./data/carnival_inputs/human_metabolomics_data.rds")
+metabolite_names = tibble(name = metabolomics$`possible annotation based on accurate mass`,
+						  pubchem = metabolomics$pubchemID) %>% unique()
+
+# metabolite names for the PKN:
+metab_map <- read_csv(here("./data/metab_to_pubchem.csv")) %>%
+	mutate(pubchem = pubchem)
+
+# use the names in the experiments if there is a mapping in both datasets
+# there is not a 1:1 mappng between name and puchem. Take the first name for each pubhchem id
+metabolite_names = metab_map %>% 
+	group_by(pubchem) %>% slice(1) %>%  # takes first name for each id. 
+	filter(! pubchem %in% metabolite_names$pubchem ) %>%
+	bind_rows(metabolite_names)
+	
+
+tf_data_list <- read_rds(here("data/carnival_inputs_cluster/tf_data.rds"))
+tf_regulon <- read_rds(here("data/carnival_inputs_cluster/tf_regulon.rds"))
+metabolomics_data_list <- read_rds(here("data/carnival_inputs_cluster/metabolomics_data.rds"))
+
+# import cosmos results and parse the log files:
+if(clean_run){
+	results_data <- tibble(res_files = list.files("./data/cosmos_results",pattern = "[0-9]+.rds",full.names = TRUE)) %>%
+		# load results
+		mutate(cosmos_out = map(res_files,read_rds)) %>%
+		# determine sample_id and repetition from file names
+		mutate(sample_id = map_chr(res_files,function(fname){
+			pname <- basename(fname) %>% gsub(".rds","",.) %>% strsplit(.,split = c("_"),fixed = TRUE) 
+			pname[[1]][[1]]
+		})) %>%
+		mutate(repetition_id = map_chr(res_files,function(fname){
+			pname <- basename(fname) %>% gsub(".rds","",.) %>% strsplit(.,split = c("_"),fixed = TRUE) 
+			ifelse(length(pname[[1]]) == 1, "0", pname[[1]][[2]])
+		})) %>%
+		# construct the name of the corresponding log file
+		mutate(log_file = 
+			   	paste0("./data/carnival_logs/",
+			   		   "carnival_",sample_id,
+			   		   ifelse(repetition_id==0,"",paste0("_",repetition_id)),
+			   		   ".out"
+			   	)) %>%
+		mutate(log = map(log_file,parse_CPLEX_log))
+	
+	results_data <- results_data %>% 
+		left_join(samples,by="sample_id") %>%
+		select(sample,cosmos_out,log,repetition_id,everything())
+	
+	write_rds(results_data,here("./data/analysis_data/results_data.rds"))
+}else{
+	results_data <- read_rds(here("./data/analysis_data/results_data.rds"))
+	
+}
+```
+
+## Quality of solutions
+For each sample we run the COSMOS optimization 10 times, for 15 hours each, 
+however in some cases the optimizaiton reached a memory limit of our cluster (128 GB),
+which resulted in loss of some results.
+
+The figure below shows that for each sample, three to eight runs finished. 
+
+```{r include=FALSE}
+# arrange the optimisation results in a single line
+tidy_optim_results <- function(log_item){
+	tibble(GAP = last(log_item$convergence$Gap),
+		   `GAP [%]` = last(log_item$convergence$`Gap [%]`),
+		   objective = last(log_item$objective),
+		   n_solution = last(log_item$n_solutions),
+		   termination_reason = last(log_item$termination_reason))
+}
+
+
+optim_results <- results_data %>% select(sample,repetition_id,log) %>%
+	mutate(optim_stats = map(log,tidy_optim_results)) %>%
+	unnest(optim_stats)
+```
+
+
+```{r echo=FALSE}
+optim_results %>% ggplot() + geom_bar(aes(sample)) + 
+	ggtitle("Number of finished optimisation runs") + 
+	theme_bw() + theme(axis.text.x = element_text(angle=45,hjust = 1))
+```
+In each run we instructed the optimizer to enumerate multiple solutions, however, 
+in most cases it found only a few (6-9) solutions. There are two samples, where
+many equivalent solutins were found. 
+
+```{r echo=FALSE}
+optim_results %>% group_by(sample) %>%
+	summarise(total_solutions = sum(n_solution),.groups="drop") %>%
+	ggplot() + geom_col(aes(sample,total_solutions)) +
+	geom_text(aes(sample,total_solutions,label=total_solutions),nudge_y = 10) +
+	ggtitle("Number of found solutions") + 
+	theme_bw() + theme(axis.text.x = element_text(angle=45,hjust = 1))
+```
+
+
+### Objective functions:
+The objective function measures the quality of each optimization. The objective function has two parts 
+
+(1) the sum of absolute difference between the model simulation and measurements and
+(2) the number of edges used to explain the data. 
+
+therefore a smaller value is better. 
+
+```{r echo=FALSE}
+optim_results %>% ggplot() + 
+	geom_jitter(aes(sample,objective,col=repetition_id),width = 0.1,height = 0) + 
+	ggtitle("Final objective function values") + 
+	theme_bw() + 
+	theme(axis.text.x = element_text(angle=45,hjust = 1))
+```
+
+This figure shows that the repeated runs achieved similar objective functions. This give 
+us confidence that they found a global optimal solution. 
+
+The samples _colon_1000uM_24h_ and _colon_100uM_24h_ have high objective function
+which means that the number of measurements are not well explained in those cases. 
+We check the reason below.
+
+Since the objective functions are similar in each sample, we can aggregate the multiple runs. 
+
+
+
+## Explained inputs and measurements
+How many inputs and outputs are explained by the inferred networks?
+
+```{r include=FALSE}
+# merge the cosmos inputs and outputs:
+tf_data = enframe(tf_data_list,name = "sample",value="tf_data")
+metabolomics_data = enframe(metabolomics_data_list, name = "sample",value="metabolomics_data")
+
+cosmos_total <- results_data %>%
+	left_join(tf_data,by = "sample")%>% 
+	left_join(metabolomics_data,by = "sample")
+```
+
+```{r echo=FALSE}
+explained_variables <- cosmos_total %>% 
+	mutate(explained_nodes = pmap(.,function(cosmos_out,tf_data,metabolomics_data,...){
+		
+		tibble(n_tfs = length(tf_data),
+			   modelled_tfs = sum(names(tf_data) %in% c(cosmos_out$aggregated_network$source,cosmos_out$aggregated_network$target)),
+			   modelled_tfs_rel = modelled_tfs/length(tf_data),
+			   n_metabolites = length(metabolomics_data),
+			   modelled_metabolites = sum(names(metabolomics_data) %in% c(cosmos_out$aggregated_network$source,cosmos_out$aggregated_network$target)),
+			   modelled_metabolites_rel = modelled_metabolites/length(metabolomics_data))
+		
+	})) %>% unnest(explained_nodes) %>%
+	group_by(sample) %>%
+	summarise(across(.cols = c(9:14),mean))
+	
+
+explained_variables %>% select(sample,n_tfs,modelled_tfs,n_metabolites,modelled_metabolites) %>% print()
+```
+The above table shows how many of the transcription factors (`n_tfs`) and metabolites (`n_metabolites`)
+are explained in average by the COSMOS results (`modelled_tfs` and `modelled_metabolites`). 
+
+There are a few reasons why not all of them are included: 
+
+- there is a trade-off between model complexity (number of edges) and fitness: each edge in the model 
+adds to the objectve function, therefore it is better to leave out some nodes than included many edges. 
+- early termination of the optimization: optimization might needed more time to integrate more nodes, but
+this also means higher memory usage, which was limited. 
+- possible controversiality between data and prior knowledge. 
+
+
+The above numbers explain why samples `colon_1000uM_24` and `colon_100uM_24` had high objective
+function value. These samples had 400+ metabolites as inputs but only 30% of them 
+are included in the solutions. 
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# Rename the proteins and metabolites to user friendly names: 
+omnipath_ptm = read_rds("./data/carnival_inputs/omnipath_ptm.rds")
+
+metabolite_names_vec = metabolite_names$name
+names(metabolite_names_vec) = metabolite_names$pubchem
+
+clean_metabolic_expression <- function(metab_name){
+	
+	metab_name %>% gsub("^Metab__","",x = .) %>%
+		gsub("___([a-z])____","_\\1",x = .) 
+	
+}
+
+clean_enzyme_expression <- function(enzyme_name){
+	
+	enzyme_name %>% gsub("^Enzyme[0-9]+__","",x = .) %>%
+		gsub("_reverse","",x = .) %>%
+		gsub("EXCHANGE[1-9]+","",x = .) 
+	
+}
+
+extract_clean_names <- function(node_table){
+	
+
+	
+	node_table %>% mutate(clean_names = Nodes) %>%
+		# fix metabolite names: removes compartments
+		mutate(clean_names = ifelse(grepl("^Metab",clean_names),clean_metabolic_expression(clean_names),clean_names)) %>%
+		mutate(clean_names = ifelse(grepl("^Enzyme",clean_names),clean_enzyme_expression(clean_names),clean_names)) %>%
+		left_join(mutate(metab_map,pubchem = as.character(pubchem)),by = c("clean_names" = "pubchem")) %>%
+		mutate(clean_names = ifelse(!is.na(name),name,clean_names)) %>%
+		select(-name) %>%
+		dplyr::select(Nodes,clean_names,everything()) %>%
+		mutate(compartment = ifelse(type == "metabolite",gsub(".*_","",clean_names),NA)) %>%
+		mutate(clean_names = ifelse(type == "metabolite",gsub("_[a-z]","",clean_names),clean_names))
+}
+
+
+
+cosmos_networks <-  cosmos_total %>%
+	dplyr::select(-log,-res_files,-sample_id,-log_file) %>%
+	dplyr::mutate(network_raw = pmap(.,function(cosmos_out,tf_data,metabolomics_data,...){
+		
+		res <- format_COSMOS_res(cosmos_res = cosmos_out,
+								 metab_mapping = metabolite_names_vec,
+								 gene_mapping = "org.Hs.eg.db",
+								 measured_nodes = c(names(metabolomics_data),names(tf_data)),
+								 omnipath_ptm = omnipath_ptm
+		)
+		
+		edges = res[[1]]
+		nodes = res[[2]]
+		nodes_updated <- extract_clean_names(nodes)
+		return(list(edges,nodes_updated))
+		
+	}))
+```
+
+
+
+
+```{r include=FALSE}
+show_network <- function(graph,title){
+	
+	edges= graph[[1]] %>% dplyr::rename(from = source,
+										to = target) %>%
+		
+		mutate(color = "black") %>%
+		mutate(value = weight) %>%
+		mutate(arrows.to.type = c("circle","arrow")[as.factor(interaction)])
+	
+	nodes = graph[[2]] %>% as_tibble() %>%
+		filter(Nodes %in% c(edges$from, edges$to)) %>% 
+		dplyr::rename(id=Nodes) %>%
+		# work on the graph format
+		dplyr::mutate(label = clean_names) %>%
+		#dplyr::slice(148) %>%
+		dplyr::mutate(shape = purrr::map_chr(type, function(x){
+			switch(x, "metabolite" = "diamond",
+				   "metab_enzyme" ="square",
+				   "TF" = "star", 
+				   "protein" ="ellipse",
+				   "Kinase" = "ellipse")	
+			
+		} )) %>%
+		dplyr::mutate(borderWidth = ifelse(measured,1,0)) %>%
+		mutate(color.background = c("red","blue")[as.factor(Activity)],
+			   color.border = c("white","black")[as.factor(measured)])
+	
+	
+	vn <- visNetwork::visNetwork(nodes = nodes,edges = edges,main = title)  %>%
+		visNetwork::visNodes() %>%
+		visNetwork::visEdges(smooth = FALSE) %>%
+		visNetwork::visPhysics(stabilization = FALSE) %>%
+		visNetwork::visIgraphLayout()
+	return(vn)
+	
+}
+cosmos_networks <- cosmos_networks %>% mutate(visnet_network = map2(network_raw,paste(sample,repetition_id),show_network))
+# cosmos_networks$visnet_network[[1]]
+```
+
+
+## Aggregated network solutions
+Since the objective function values of the optimized models are similar, we 
+can merge them. In the visualization we weight each edge by the time it 
+appears across the solutions. This weight shows "essentiality" of the edges, i.e. 
+the edges that disappears in some solutions are not essential to explain the data. 
+
+Note, if an edge appears in all solutions, it does not necessarily mean that there 
+is no alternative explanation. It can happen that the optimizer didn't find this 
+alternative solution or the alternative solution includes more edges -- our approch
+seeks for the smallest possible model. 
+
+
+```{r include=FALSE}
+aggregate_interactions <- function(network,N_sol){
+	
+	sifs = lapply(network,function(x)x[[1]])
+	names(sifs) = paste0("network",1:length(sifs))
+	
+	sif_all <- bind_rows(sifs,.id = "network")
+	solutions <- tibble(N_sol = N_sol, network =  paste0("network",1:length(sifs)))
+	
+	## edge_weigth * number of solutions  gives the number of times the edge appeared. 
+	# then appearance can be sum-ed across repetitions
+	sif_all <- sif_all %>%
+		left_join(solutions,by="network") %>%
+		mutate(appearance = N_sol * weight) %>%
+		group_by(source,interaction,target) %>%
+		summarise(total_appearance = sum(appearance),.groups = "drop" ) %>%
+		mutate(total_rel_appearance = total_appearance/sum(N_sol))
+	
+	return(list(sif_all))
+}
+
+aggregate_nodes <- function(network,N_sol){
+	
+	nodes = lapply(network,function(x)x[[2]])
+	names(nodes) = paste0("network",1:length(nodes))
+	
+	nodes_all <- bind_rows(nodes,.id = "network")
+	solutions <- tibble(N_sol = N_sol, network =  paste0("network",1:length(nodes)))
+	
+	## AvgAct * number of solutions  gives the number of times the edge was 
+	# activated-inactivated. 
+	# then appearance can be sum-ed across repetitions
+	nodes_all <- nodes_all %>% 
+		left_join(solutions,by="network") %>%
+		mutate(net_activity = N_sol * AvgAct) %>%
+		group_by(Nodes,clean_names,NodeType,measured,type) %>%
+		summarise(total_activity = sum(net_activity),.groups = "drop" ) %>%
+		mutate(total_rel_activity = total_activity/sum(N_sol))
+	
+	return(list(nodes_all))
+}
+
+consensus_cosmos_networks <- cosmos_networks %>% dplyr::select(sample, cosmos_out,network_raw) %>%
+	mutate(N_networks = map_dbl(cosmos_out,function(x)x$N_networks)) %>%
+	group_by(sample) %>%
+	dplyr::summarise(consensus_nodes = aggregate_nodes(network_raw,N_networks),
+					 consensus_edges = aggregate_interactions(network_raw,N_networks),.groups="drop")
+
+
+# remove those nodes that are not in the edge table
+
+consensus_cosmos_networks <- consensus_cosmos_networks %>% mutate(consensus_nodes  = map2(consensus_nodes,consensus_edges,function(nodes,edges){
+	
+	 filtered_nodes <- nodes %>% filter(Nodes %in% c(edges$source,edges$target))
+	
+}))
+
+
+```
+
+
+
+
+```{r include=FALSE}
+
+show_consensus_network <- function(interactions, nodes,title){
+	
+	edges= interactions %>% dplyr::rename(from = source,
+										  to = target) %>%
+		
+		mutate(color = "black") %>%
+		mutate(value = total_rel_appearance) %>%
+		mutate(arrows.to.type = c("circle","arrow")[as.factor(interaction)])
+	
+	nodes = nodes %>% as_tibble() %>%
+		filter(Nodes %in% c(edges$from, edges$to)) %>% 
+		dplyr::rename(id=Nodes) %>%
+		# work on the graph format
+		dplyr::mutate(label = clean_names) %>%
+		# simplify labels:
+		
+		#dplyr::slice(148) %>%
+		dplyr::mutate(shape = purrr::map_chr(type, function(x){
+			switch(x, "metabolite" = "diamond",
+				   "metab_enzyme" ="square",
+				   "TF" = "star", 
+				   "protein" ="ellipse",
+				   "Kinase" = "ellipse")	
+			
+		} )) %>%
+		dplyr::mutate(borderWidth = ifelse(measured,1,0)) %>%
+		mutate(color.background = c("red","blue")[as.factor(sign(total_rel_activity))],
+			   color.border = c("white","black")[as.factor(measured)])
+	
+	
+	N = visNetwork::visNetwork(nodes = nodes,edges = edges,main = title)  %>%
+		visNetwork::visNodes() %>%
+		visNetwork::visEdges(smooth = FALSE) %>%
+		visNetwork::visPhysics(stabilization = FALSE) %>%
+		visNetwork::visIgraphLayout()
+	
+	return(N)
+}
+
+networks <- pmap(consensus_cosmos_networks,~with(list(...),show_consensus_network(consensus_edges,consensus_nodes,sample)))
+
+```
+
+
+The following figures show the consensus networks of each sample.
+Please note that you can zoom in to the network and rearrange the nodes if needed. 
+
+Legend: 
+
+Node type is encoded by the shape:
+
+- Metabolites - diamond
+- Metabolic enzyme - square
+- transcription factor - star
+- other proteins - ellipse
+
+Colors:
+
+- down-regulation - red 
+- up-regulation - blue
+
+Black border represents input and output nodes: estimated trascription factors and measured metabolites. 
+
+
+```{r}
+networks[[1]]
+```
+
+
+```{r}
+networks[[2]]
+```
+
+
+```{r}
+networks[[3]]
+```
+
+
+```{r}
+networks[[4]]
+```
+
+
+```{r}
+networks[[5]]
+```
+
+
+```{r}
+networks[[6]]
+```
+
+```{r}
+networks[[7]]
+```
+
+### Export sample networks to cytoscape
+```{r}
+cytoscape_folder = "./data/cosmos_samples_cytoscape_inputs"
+dir.create(cytoscape_folder,showWarnings = FALSE)
+consensus_cosmos_networks	%>% mutate(pmap(.,function(sample,consensus_edges,consensus_nodes,...){
+		sif_file = paste0(cytoscape_folder, "/",sample,"_sif.tsv")
+		attribute_file = paste0(cytoscape_folder, "/",sample,".tsv")
+		edges = consensus_edges
+		nodes = consensus_nodes
+		edges$interaction = ifelse(edges$interaction==1,"up","down")
+		
+		edges <- edges %>% rename(essentiality = "total_rel_appearance") %>%
+			select(-total_appearance)
+		nodes <- nodes %>% rename(name = "clean_names",activity="total_rel_activity") %>%
+			select(-NodeType,-total_activity)
+		
+		write_tsv(select(edges,source,interaction,target,essentiality),file = sif_file )
+		write_tsv(nodes,file = attribute_file )
+		return(TRUE)
+		
+}))
+```
+
+
+
+
+
+
+### edge similarities
+We clustered the samples based on the edges in their networks:
+rows represent the edges, samples are in the columns. The color shows the essentiality of the edge. 
+
+Early time SI samples are the most similar and late time colon samples also cluster together. 
+
+
+```{r echo=FALSE, fig.width=3, fig.height=4}
+edge_table <- consensus_cosmos_networks %>% select(sample,consensus_edges) %>%
+	unnest(consensus_edges) %>%
+	mutate(source = ifelse(grepl("^Metab",source),clean_metabolic_expression(source),source)) %>%
+	mutate(source = ifelse(grepl("^Enzyme",source),clean_enzyme_expression(source),source)) %>%
+	mutate(target = ifelse(grepl("^Metab",target),clean_metabolic_expression(target),target)) %>%
+	mutate(target = ifelse(grepl("^Enzyme",target),clean_enzyme_expression(target),target)) %>%
+	mutate(edge = paste(source,target,sep = " -> ")) %>%
+	select(sample,edge,total_rel_appearance) %>%
+	group_by(sample,edge) %>%
+	summarise(exist = max(total_rel_appearance),.groups = "drop") 
+
+
+edge_table %>%
+	spread(sample,exist,fill = 0) %>% column_to_rownames("edge") %>%
+	pheatmap::pheatmap(show_rownames = FALSE)
+```
+
+We filter for edges that appear across multiple samples to look for common mechanism.
+The following heatmap shows the edges for the samples that appears in at least 4 samples.  
+
+There are some interactions that appear exclusively for colon samples and some that
+appear across all the samples. 
+
+```{r, fig.height=12,fig.width=7, echo=FALSE}
+common_edges <- edge_table %>% group_by(edge) %>%
+	summarise(n_samples = n(),.groups="drop") %>% 
+	arrange(desc(n_samples)) %>%
+	filter(n_samples > 3) %>% pull(edge)
+
+
+edge_table %>% filter(edge %in%common_edges ) %>%
+	spread(sample,exist,fill = 0) %>% column_to_rownames("edge") %>%
+	pheatmap::pheatmap(show_rownames = TRUE)
+```
+
+### Node similarities
+We clustered the samples based on the nodes in their networks:
+rows represent the nodes, samples are in the columns.
+
+Early time SI samples are the most similar and late time colon samples also cluster together. 
+
+
+```{r echo=FALSE, fig.height=4, fig.width=3}
+node_table <- consensus_cosmos_networks %>% select(sample,consensus_nodes) %>%
+	unnest(consensus_nodes) %>%
+	select(sample,clean_names,total_rel_activity) %>%
+	group_by(sample,clean_names) %>%
+	summarise(exist = median(total_rel_activity),.groups = "drop") 
+
+
+node_table %>%
+	spread(sample,exist,fill = 0) %>% column_to_rownames("clean_names") %>%
+	pheatmap::pheatmap(show_rownames = FALSE)
+```
+
+We filter for nodes that appear across multiple samples to look for common mechanism.
+The following heatmap shows the nodes for the samples that appears in at least 3 samples.  
+
+
+
+```{r, fig.height=15, fig.width=5, echo=FALSE}
+common_nodes <- node_table %>% group_by(clean_names) %>%
+	summarise(n_samples = n(),.groups="drop") %>% 
+	arrange(desc(n_samples)) %>%
+	filter(n_samples > 3) %>% pull(clean_names)
+
+
+node_table %>% filter(clean_names %in% common_nodes ) %>%
+	spread(sample,exist,fill = 0) %>% column_to_rownames("clean_names") %>%
+	pheatmap::pheatmap(show_rownames = TRUE,main = "Node activity")
+```
+
+
+
+## Pathways in the solution networks
+Which genes-sets are represented in results more than random? We apply over-representation
+analysis to answer this question. 
+We use MSigDB gene sets: Hallmark genes and Canonical pathways for the analysis. 
+
+**Hallmark gene sets** summarize and represent specific well-defined biological
+states or processes and display coherent expression.
+
+**Canonical pathways:** Gene sets from pathway databases. Usually, these gene
+sets are canonical representations of a biological process compiled by
+ domain experts.
+
+```{r include=FALSE}
+# ConsensusPathDB-human:
+#  formatting to piano compatible data.frame
+# CPDB_genesets <- read_tsv("./data/CPDB_pathways_genes.tab")
+# CPDB_genesets_df <- CPDB_genesets %>% 
+# 	filter(source == "Reactome") %>%
+# 	select(pathway,hgnc_symbol_ids ) %>% 
+# 	mutate(gene_list = strsplit(hgnc_symbol_ids,split = ",")) %>%
+# 	select(-hgnc_symbol_ids) %>%
+# 	unnest(gene_list)
+# CPDB_gsc = piano::loadGSC(CPDB_genesets_df[,2:1])
+
+msigdb <- read_rds("./data/msigdb_Genesets_Dec19.rds")
+
+msig_to_df <- function(msig_collection){
+	enframe(msig_collection) %>% unnest(value) %>%
+		rename(geneset = name, gene=value) %>%
+		select(gene,geneset)
+}
+
+
+# background genes: all the genes that appear in the PKN
+meta_network = cosmos::load_meta_pkn()
+prots <- unique(c(meta_network$source,meta_network$target))
+prots <- prots[!grepl("XMetab",prots)]
+prots <- gsub("^X","",prots)
+prots <- gsub("Gene[0-9]+__","",prots)
+prots <- gsub("_reverse","",prots)
+prots <- gsub("EXCHANGE.*","",prots)
+prots <- unique(prots)
+prots <- unlist(sapply(prots, function(x){unlist(strsplit(x,split = "_"))}))
+
+entrezid <- prots
+gene_mapping <- AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db, entrezid, 'SYMBOL', 'ENTREZID')
+gene_mapping <- unlist(gene_mapping)
+gene_mapping <- gene_mapping[!is.na(gene_mapping)]
+background_genes <- unique(gene_mapping)
+
+# over_rep_analysis <- consensus_cosmos_networks %>% mutate(CPDB_pws = map(consensus_nodes,function(nodes){
+# 	
+# 	genes_in_solutions = nodes$clean_names[nodes$clean_names %in% background_genes] %>%unique()
+# 	
+# 	CPDB_ora <- piano::runGSAhyper(genes = genes_in_solutions,
+# 					   universe = background_genes,
+# 					   gsc = CPDB_gsc)
+# 	
+# 	ora_results <- CPDB_ora$resTab %>% as_tibble() %>% arrange(`Adjusted p-value`) %>%
+# 		mutate(pathway = rownames(CPDB_ora$resTab)) %>%
+# 		select(pathway,everything())
+# 	
+# })) 
+
+# runs overrepresentation analysis for given genes and genesets
+run_ora <- function(nodes,edges,background,piano_geneset_obj){
+	
+	
+	genes_in_solutions <- nodes %>% filter(Nodes %in% c(edges$source,edges$target))%>%
+		filter(clean_names %in% background) %>%
+		pull(clean_names) %>% unique()
+	#genes_in_solutions = nodes$clean_names[nodes$clean_names %in% background] %>% unique()
+	
+	ora <- piano::runGSAhyper(genes = genes_in_solutions,
+					   universe = background,
+					   gsc = piano_geneset_obj)
+	ora_results <- ora$resTab %>% as_tibble() %>% arrange(`Adjusted p-value`) %>%
+		mutate(pathway = rownames(ora$resTab)) %>%
+		select(pathway,everything())
+}
+
+
+hallmark_set <- msig_to_df(msigdb$MSIGDB_HMARKS) %>% 
+	filter(gene %in%background_genes ) %>%
+	piano::loadGSC() 
+
+ora_hallmarks <- consensus_cosmos_networks %>%
+	mutate(hallmark_pws = map2(.x = consensus_nodes,.y = consensus_edges,.f = run_ora,background = background_genes,piano_geneset_obj = hallmark_set)) %>%
+	unnest(hallmark_pws) %>% select(-consensus_nodes,-consensus_edges)
+
+
+canonical_set <- msig_to_df(msigdb$MSIGDB_CANONICAL) %>% 
+	filter(gene %in%background_genes ) %>%
+	piano::loadGSC() 
+
+ora_canonical <- consensus_cosmos_networks %>%
+	mutate(canonical_pws = map2(.x = consensus_nodes,.y = consensus_edges, .f = run_ora,background = background_genes,piano_geneset_obj = canonical_set)) %>%
+	unnest(canonical_pws) %>% select(-consensus_nodes,-consensus_edges)
+
+
+```
+
+
+
+```{r,fig.width=20, fig.height= 15}
+ora_hallmarks %>%
+	group_by(sample) %>% slice_min(n=25,order_by = `Adjusted p-value`) %>%
+	ggplot() + geom_col(aes(reorder(pathway,-`Adjusted p-value`),-log10(`Adjusted p-value`))) +
+	geom_hline(yintercept = -log10(0.05),color="red",linetype = 2) +
+	facet_wrap(~sample,scales = "free_y") + coord_flip() +theme_bw() + ggtitle("ORA using Hallmarks")
+```
+
+
+
+
+
+```{r,fig.width=20, fig.height= 15}
+ora_canonical %>%
+	group_by(sample) %>% slice_min(n=25,order_by = `Adjusted p-value`) %>%
+	ggplot() + geom_col(aes(reorder(pathway,-`Adjusted p-value`),-log10(`Adjusted p-value`))) +
+	geom_hline(yintercept = -log10(0.05),color="red",linetype = 2) +
+	facet_wrap(~sample,scales = "free_y") + coord_flip() +theme_bw() + 
+	ggtitle("ORA using Canonical Pathways")
+```
+
+
+### Pathway: TNFA_SIGNALING_VIA_NFKB
+
+```{r}
+
+HALLMARK_TNFA_SIGNALING_VIA_NFKB_genes <- msig_to_df(msigdb$MSIGDB_HMARKS) %>%
+	filter(geneset=="HALLMARK_TNFA_SIGNALING_VIA_NFKB")
+
+# is there some genes that appears across all the samples? 
+
+consensus_cosmos_networks %>% select(sample,consensus_nodes) %>%
+	unnest(consensus_nodes) %>%
+	filter(clean_names %in% HALLMARK_TNFA_SIGNALING_VIA_NFKB_genes$gene) %>%
+	group_by(sample) %>% 
+	summarise(genes_in_set = paste(clean_names,collapse = ", "),.groups="drop")
+```
+
+## Filtering network for relevant pathways
+
+pathways found in paper:
+
+- Cell Cycle (Cell Cycle)
+- DNA replication (DNA Replication)
+- DNA synthesis (Synthesis of DNA)
+- DNA damage (?)
+- p53 signaling
+- Apoptosis
+- Respiratory electron transport and ATP synthesis
+- Metabolism
+
+
+
+
+```{r}
+pw_file <- here("./data/List relevant pathways and DEGs.xlsx")
+sheets <- readxl::excel_sheets(pw_file)
+
+pw_table_raw <- tibble(sheet_name =sheets ) %>% 
+	mutate(sheet = map(sheet_name,~readxl::read_excel(path = pw_file,sheet = .x))) 
+
+
+pw_table <- pw_table_raw %>% mutate(sample = gsub(" ","uM_",sheet_name)) %>%
+	select(sample,sheet) %>%
+	mutate(sheet = map(sheet, ~gather(.x, key = pathway, value = genes))) %>%
+	unnest(sheet) %>%
+	filter(!is.na(genes)) %>%
+	mutate(gene_symb = AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db, genes, 'SYMBOL', 'ENSEMBL'))
+
+					
+```
+
+
+```{r}
+# pw_networks: contains a network for each gene-set and each sample. 
+pw_networks <- pw_table %>% 
+	nest(pw_genes =c(genes,gene_symb) ) %>%
+	full_join(consensus_cosmos_networks, by="sample") %>%   ## Full-join! 
+	filter(!is.na(pathway))
+
+```
+
+# Find transcription factors: 
+
+```{r}
+
+# example
+# sample = pw_networks$sample[[8]]
+# pathway = pw_networks$pathway[[8]]
+# consensus_nodes = pw_networks$consensus_nodes[[8]]
+# consensus_edges = pw_networks$consensus_edges[[8]]
+# pw_genes = pw_networks$pw_genes[[8]]
+
+# Overlap of network nodes and genesets
+
+
+pw_overlap <- pw_networks %>% 
+	mutate(pmap_dfr(.,function(sample,pathway,pw_genes,consensus_nodes,consensus_edges){
+	
+	# check which node are in the pathway
+	nodes_in_patway <- consensus_nodes %>%
+		mutate(in_pathway = clean_names %in% pw_genes$gene_symb) %>%
+		filter(in_pathway==TRUE) 
+	
+	
+	return(tibble(nodes_in_patway = list(nodes_in_patway)))
+	
+})) %>% select(sample,pathway,nodes_in_patway) %>%
+	unnest(nodes_in_patway) %>%
+	select(sample,pathway,Nodes) %>%
+	group_by(sample,pathway) %>%
+	summarise(n_nodes_shared  = n())
+	
+
+
+
+pw_networks_results <- pw_networks %>% 
+	mutate(pmap_df(.,function(sample,pathway,pw_genes,consensus_nodes,consensus_edges){
+	
+	# check which node are in the pathway
+	nodes_in_patway <- consensus_nodes %>%
+		mutate(in_pathway = clean_names %in% pw_genes$gene_symb) %>%
+		filter(in_pathway==TRUE) %>% pull(Nodes)
+	
+	tfs_in_patway <- consensus_nodes %>%
+		mutate(in_pathway = clean_names %in% pw_genes$gene_symb) %>%
+		filter(in_pathway==TRUE, type=="TF") %>% pull(Nodes)
+	
+	edges = consensus_edges %>% dplyr::rename(from = source,
+											  to = target)
+	
+	if(length(tfs_in_patway)==0) return(tibble(edges=list(NULL),nodes = list(NULL)))
+	
+	# look for the neighbourhood of these nodes and collect them
+	G = consensus_edges %>% select(source,target,everything()) %>%
+		igraph::graph_from_data_frame(.,directed = TRUE) 
+	
+	#ig_net <- igraph::make_ego_graph(G, nodes = tfs_in_patway, order = 3, mode = "out")
+	
+	# we check all nodes 
+	ig_net <- igraph::make_ego_graph(G, nodes = c(tfs_in_patway,nodes_in_patway), order = 2, mode = "all")
+	
+	to_keep <- unlist(sapply(ig_net,function(x){igraph::V(x)$name}))
+	
+	
+	edges = consensus_edges %>% dplyr::rename(from = source,
+										  to = target) %>%
+		filter(to %in% to_keep,from %in% to_keep) %>%
+		mutate(essentiality = total_rel_appearance) 
+	
+	nodes = consensus_nodes %>%
+		filter(Nodes %in% c(edges$from, edges$to)) %>% 
+		dplyr::rename(id=Nodes) %>%
+		# work on the graph format
+		dplyr::mutate(label = clean_names) %>%
+		mutate(in_pathway = id %in% nodes_in_patway)
+	
+	return(tibble(edges=list(edges),nodes = list(nodes)))
+	
+})) %>%
+	# detect empty and remove them: 
+	mutate(remove = map_lgl(edges,~is.null(.x))) %>%
+	filter(!remove) %>% select(-remove)
+
+edges <- pw_networks_results$edges[[1]]
+nodes <- pw_networks_results$nodes[[1]]
+pahway <- pw_networks_results$pathway[[1]]
+
+pw_networks_visNet <- pw_networks_results %>%
+	mutate(pmap_df(.,function(sample,pathway,edges,nodes,...){
+		
+		edges = edges %>%
+			mutate(color = "black") %>%
+			mutate(value = essentiality) %>%
+			mutate(arrows.to.type = c("circle","arrow")[as.factor(interaction)]) %>%
+			mutate(color = "grey")
+		
+		
+		nodes = nodes %>%
+			# work on the graph format
+			dplyr::mutate(label = clean_names) %>%
+			dplyr::mutate(shape = purrr::map_chr(type, function(x){
+				switch(x, "metabolite" = "diamond",
+					   "metab_enzyme" ="square",
+					   "TF" = "triangle", 
+					   "protein" ="dot",
+					   "Kinase" = "dot")	
+			} )) %>%
+			dplyr::mutate(borderWidth = ifelse(in_pathway,3,0)) %>%
+			mutate(color.background = c("#E41A1C","#999999","#377EB8")[factor(sign(total_rel_activity),levels = c(-1,0,1))],
+				   color.border = c("white","black")[as.factor(in_pathway)]) %>%
+			#mutate(color.background = ifelse(in_pathway,"green",color.background)) %>%
+			mutate(size = ifelse(type=="TF",50,25))
+		
+		title = paste0(pathway,": ",sample)
+		print(title)
+		
+		N = visNetwork::visNetwork(nodes = nodes,edges = edges,main = title)  %>%
+			visNetwork::visNodes(font = list(size=20)) %>%
+			visNetwork::visEdges(smooth = FALSE) %>%
+			visNetwork::visPhysics(stabilization = FALSE) 		%>%
+			#visNetwork::visHierarchicalLayout()
+			visNetwork::visIgraphLayout()	
+		
+		return(tibble(edges=list(edges),nodes = list(nodes), vis_net = list(N)))
+		
+	}))
+
+
+
+
+```
+
+
+
+
+# Cell Cycle
+```{r}
+pw_networks_visNet %>% filter(pathway == "Cell cycle") %>%
+	pull(vis_net)
+```
+
+
+```{r}
+pw_networks_visNet %>% filter(pathway == "Metabolism") %>%
+	pull(vis_net)
+```
+
+```{r}
+pw_networks_visNet %>% filter(pathway == "Apoptosis") %>%
+	pull(vis_net)
+```
+
+
+
+```{r}
+pw_networks_visNet %>% filter(pathway == "DNA damage response") %>%
+	pull(vis_net)
+```
+
+
+
+
+### Export to cytoscape sif and attribute fiels
+
+
+```{r}
+
+cytoscape_folder = "./data/cosmos_pathway_cytoscape_inputs"
+dir.create(cytoscape_folder,showWarnings = FALSE)
+pw_networks_results	%>% mutate(pmap(.,function(sample,pathway,edges,nodes,...){
+		sif_file = paste0(cytoscape_folder, "/",paste0(pathway,"_",sample),"_sif.tsv")
+		attribute_file = paste0(cytoscape_folder, "/",paste0(pathway,"_",sample),".tsv")
+		
+		edges$interaction = ifelse(edges$interaction==1,"up","down")
+		
+		edges <- edges %>% rename(source = "from",target="to")
+		nodes <- nodes %>% rename(name = "clean_names",activity="total_rel_activity") %>%
+			select(-NodeType,-total_activity)
+		
+		write_tsv(select(edges,source,interaction,target,essentiality),file = sif_file )
+		write_tsv(nodes,file = attribute_file )
+		return(TRUE)
+		
+}))
+```
+
+
+
+#### Export metabolic names
+
+```{r}
+network_metabs <- consensus_cosmos_networks$consensus_nodes[[1]] %>% filter(type=="metabolite")
+
+#network_metabs %>% left_join(metabolomics,by = c(Nodes = "cosmosID"))
+network_metabs %>% select(clean_names) %>% write_csv("./temp.csv")
+```
+
+
+
+
+
+
+
+
+
+

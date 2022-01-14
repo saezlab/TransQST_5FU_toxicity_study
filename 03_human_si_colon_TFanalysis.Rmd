@@ -1,0 +1,361 @@
+---
+title: "Human SI and colon organoids: TF estimation"
+author: "A. Gabor"
+date: "10/8/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#library(biomaRt)
+library(tidyverse)
+# download dorothea from Attila Gabor's repo! 
+library(dorothea)
+```
+
+## Intro
+
+Here we compute the transcription factor and pathway activity of the 5-FU treated human in-vitro data.
+This will give us an overview of the relevant pathways and TFs activated and responding to 
+the drug, depending on time and concentration. 
+
+## Issue with transcriptomics data
+There is a problem in DE analysis: some genes with no expression gets very high
+log2FC. Check the `human_SI_transcriptomics_issue` script to see details. 
+
+We found that if we filter out the genes that have zero expression across more than 
+one replica the issue resolves. 
+
+
+
+## Import and preprocess the transcriptomics data
+
+First, we import all the transcriptomics data of SI and Colon samples treated with 5-FU.
+This data was already preprocessed, i.e. we removed the 
+genes where the log2 FC was artificially high, while the expression was zero. 
+
+```{r import, message=FALSE, warning=FALSE, include=FALSE}
+import_human_transcriptomics_preprocessed_data <- function(){
+	# SI transciptomics data: 
+	SI_data <- read_rds("./data/5-FU in vitro human/transcriptomics/SI/SI_transcriptomics_diffExp_filtered_data.rds") %>%
+		add_column(organ = "SI")
+	# Colon transciptomics data: 
+	Colon_data <- read_rds("./data/5-FU in vitro human/transcriptomics/colon/colon_transcriptomics_diffExp_filtered_data.rds") %>%
+		add_column(organ = "colon")
+	
+	transcriptomics_data <- bind_rows(SI_data,Colon_data) %>% mutate(sample_id = paste0(organ,"_",fileID))
+	
+}
+```
+
+```{r}
+transcriptomics_data <- import_human_transcriptomics_preprocessed_data()
+sample_table <-  transcriptomics_data %>% select(concentration,sample_id,organ,time) %>% unique()
+```
+
+## Calculate TF activity:
+
+We use the Dorothea regulon(from the `dorothea` package), which contains 
+transcription factors and their targets encoded by gene symbols (HGNC). 
+Therefore, first we need to map the Ensembl gene ids to HGNC. 
+
+#### Gene name conversion
+```{r include=FALSE}
+# load dorothea regulons with the standard AB confidence levels: 
+regulons <- dorothea::dorothea_hs %>%
+	dplyr::filter(confidence %in% c("A", "B"))
+
+tf_table <- AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db, 
+								  unique(transcriptomics_data$ensembl_gene_id),
+								  'SYMBOL', 'ENSEMBL')
+
+genes_dic <- tibble(ensembl_gene_id =  names(tf_table),
+					hgnc_symbol = tf_table) %>%
+	filter(complete.cases(.)) %>%
+	unique()
+
+
+#Finding missing genes: 
+tr_genes <- transcriptomics_data$ensembl_gene_id %>% unique()
+# number of genes found by gene symbol
+tr_genes_found <- sum(tr_genes %in% genes_dic$ensembl_gene_id)
+# missing genes
+tr_genes_notfound <- sum(!tr_genes %in% genes_dic$ensembl_gene_id)
+```
+
+- out of `r length(tr_genes)` ensembl genes, we found `r tr_genes_found`
+- didn't find `r tr_genes_notfound`
+
+List of missing, but significantly changing genes: 
+```{r}
+# We are missing the following ENSEMBL ids: 
+missing_genes = tr_genes[!tr_genes %in% genes_dic$ensembl_gene_id]
+# around 10-15 genes are significantly different between conditions:
+transcriptomics_data %>% 
+	filter(ensembl_gene_id %in% missing_genes) %>% 
+	filter(padj<0.05) %>%
+	arrange(padj)
+```
+
+
+```{r include=FALSE}
+n_missing_HGCN <- genes_dic %>% 
+	filter(ensembl_gene_id %in% transcriptomics_data$ensembl_gene_id) %>%
+	filter(nchar(hgnc_symbol)==0) %>% nrow()
+```
+`r n_missing_HGCN` genes has no HGCN name. 
+
+Add the gene names to the transcription data:
+```{r}
+transcriptomics_data <- transcriptomics_data %>%
+	left_join(genes_dic, by = "ensembl_gene_id")
+```
+
+Some Ensembl id were not found, we removed those genes and also those that have no 
+gene names. Averaged those transcripts that have the same gene name. 
+
+```{r echo=TRUE}
+dorothea_data = transcriptomics_data %>%
+	filter(!is.na(hgnc_symbol)) %>%
+	filter(nchar(hgnc_symbol)!=0)
+
+# in each condition, each gene (ensemble_gene_id) appears once:
+dorothea_data %>% group_by(sample_id,ensembl_gene_id) %>% summarise(n_records = n()) %>%
+	pull(n_records) %>% max()
+
+# but more ensembl id corresponds to the same gene name
+dorothea_data %>% group_by(sample_id,hgnc_symbol) %>% summarise(n_records = n()) %>%
+	arrange(desc(n_records))
+
+# we take the mean log2FC for these
+dorothea_data_hgnc <- dorothea_data %>% 
+	group_by(sample_id,hgnc_symbol) %>%
+	summarise(log2FC = mean(log2FoldChange))
+```
+
+
+Check how many transcriptional interactions are remaining in the data
+```{r}
+regulons %>% 
+	filter(target %in% dorothea_data$hgnc_symbol) %>% 
+	nrow() %>%
+	print()
+nrow(regulons)
+```
+
+4873 of the 6620 TF target transcripts are found in the data. 
+
+#### TF estimation
+
+Run VIPER to estimate TF activity in samples. 
+We run the analysis on log2 FC, therefore we get TFs that are strongly up/down
+regulated in treatment vs control. 
+
+```{r}
+
+# data frame with the original data
+viper_input = dorothea_data_hgnc  %>%
+	spread(sample_id,log2FC) %>%
+	column_to_rownames("hgnc_symbol")
+
+rerun = FALSE
+if(rerun){
+	tf_activities <- dorothea::run_gviper(viper_input, regulons,
+										  options =  list(minsize = 5, eset.filter = FALSE, 
+										  				cores = 1, verbose = TRUE, nes = TRUE),tidy = TRUE)
+	
+	# attach the description of the samples
+	tf_activities <- left_join(tf_activities,
+							   rename(sample_table,sample = sample_id),
+							   by = "sample")
+	
+	if(FALSE) write_rds(tf_activities,"./data/results/tf_activity_gviper_all_human.rds")
+}else{
+	tf_activities = read_rds("./data/results/tf_activity_gviper_all_human.rds")
+}
+```
+
+```{r ViperBarplot, echo=FALSE, fig.height=12, fig.width=10, message=FALSE, dpi=300}
+# take the top 20 TFs
+tf_to_show = tf_activities %>% group_by(tf) %>%
+	summarise(max_abs_act = max(abs(activity))) %>%
+	ungroup() %>%
+	arrange(desc(max_abs_act)) %>%
+	slice(1:20) %>% pull(tf)
+
+tf_activities %>%
+	filter(tf %in% tf_to_show) %>%
+	mutate(sign = ifelse(sign(activity)==1,"up-regulated","down-regulated")) %>% 
+	ggplot(aes(x = reorder(tf, abs(activity)), y = abs(activity),alpha = abs(activity)>3)) + 
+	geom_bar(aes(fill = sign), stat = "identity") +
+	
+	#scale_fill_gradient2(low = "darkblue", high = "indianred", 
+	#						 mid = "whitesmoke", midpoint = 0) + 
+	theme_bw() +
+	theme(axis.title = element_text(face = "bold", size = 12),
+		  axis.text.x = 
+		  	element_text(angle = 90, hjust = 1, size =10, face= "bold"),
+		  axis.text.y = element_text(size =10, face= "bold"),
+		  panel.grid.major = element_blank(), 
+		  panel.grid.minor = element_blank()) +
+	xlab("Transcription Factors") +
+	scale_fill_manual(values = c("up-regulated" = "#F8766D","down-regulated"="#00BFC4")) +
+	scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.5)) +
+	facet_grid(concentration~organ+time, scales = "free_y") +
+	coord_flip()
+
+ggsave("./figures/SI_TF_activity_top25_global.pdf",width = 10,height = 15)
+```
+
+_Figure 1:_ Comprehensive overview of transcription factor activity across organs,
+time after treatment and dose. The activity is normalised, therefore
+
+
+```{r}
+tf_activities %>%
+	filter(tf %in% tf_to_show) %>%
+	filter(organ == "colon", time==24) %>%
+	mutate(concentration = paste(concentration,"uM")) %>%
+	mutate(time = paste(time," hours")) %>%
+	mutate(sign = ifelse(sign(activity)==1,"up-regulated","down-regulated")) %>% 
+	ggplot(aes(x = reorder(tf, abs(activity)), y = activity,alpha = abs(activity)>3)) + 
+	geom_bar(aes(fill = sign), stat = "identity") +
+	
+	#scale_fill_gradient2(low = "darkblue", high = "indianred", 
+	#						 mid = "whitesmoke", midpoint = 0) + 
+	theme_bw() +
+	theme(axis.title = element_text(face = "bold", size = 12),
+		  axis.text.x = 
+		  	element_text(angle = 90, hjust = 1, size =10, face= "bold"),
+		  axis.text.y = element_text(size =10, face= "bold"),
+		  panel.grid.major = element_blank(), 
+		  panel.grid.minor = element_blank()) +
+	xlab("Transcription Factors") +
+	ylab("NES") +
+	scale_fill_manual(values = c("up-regulated" = "#F8766D","down-regulated"="#00BFC4")) +
+	scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.5)) +
+	facet_grid(time~concentration, scales = "free_y") +
+	coord_flip()
+```
+
+```{r}
+tf_activities %>%
+	filter(tf %in% tf_to_show) %>%
+	filter(organ == "colon", concentration==10) %>%
+	mutate(concentration = paste(concentration,"uM")) %>%
+	mutate(time = paste(time," hours")) %>%
+	mutate(sign = ifelse(sign(activity)==1,"up-regulated","down-regulated")) %>% 
+	ggplot(aes(x = reorder(tf, abs(activity)), y = activity,alpha = abs(activity)>3)) + 
+	geom_bar(aes(fill = sign), stat = "identity") +
+	
+	#scale_fill_gradient2(low = "darkblue", high = "indianred", 
+	#						 mid = "whitesmoke", midpoint = 0) + 
+	theme_bw() +
+	theme(axis.title = element_text(face = "bold", size = 12),
+		  axis.text.x = 
+		  	element_text(angle = 90, hjust = 1, size =10, face= "bold"),
+		  axis.text.y = element_text(size =10, face= "bold"),
+		  panel.grid.major = element_blank(), 
+		  panel.grid.minor = element_blank()) +
+	xlab("Transcription Factors") +
+	ylab("NES") +
+	scale_fill_manual(values = c("up-regulated" = "#F8766D","down-regulated"="#00BFC4")) +
+	scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.5)) +
+	facet_grid(concentration~time, scales = "free_y") +
+	coord_flip()
+```
+```{r, fig.width=3,}
+tf_activities %>%
+	filter(tf %in% tf_to_show) %>%
+	filter(organ == "colon", concentration==100, time ==48 ) %>%
+	mutate(concentration = paste(concentration,"uM")) %>%
+	mutate(time = paste(time," hours")) %>%
+	mutate(sign = ifelse(sign(activity)==1,"up-regulated","down-regulated")) %>% 
+	ggplot(aes(x = reorder(tf, abs(activity)), y = activity,alpha = abs(activity)>3)) + 
+	geom_bar(aes(fill = sign), stat = "identity") +
+	
+	#scale_fill_gradient2(low = "darkblue", high = "indianred", 
+	#						 mid = "whitesmoke", midpoint = 0) + 
+	theme_bw() +
+	theme(axis.title = element_text(face = "bold", size = 12),
+		  axis.text.x = 
+		  	element_text(angle = 90, hjust = 1, size =10, face= "bold"),
+		  axis.text.y = element_text(size =10, face= "bold"),
+		  panel.grid.major = element_blank(), 
+		  panel.grid.minor = element_blank()) +
+	xlab("Transcription Factors") +
+	ylab("NES") +
+	scale_fill_manual(values = c("up-regulated" = "#F8766D","down-regulated"="#00BFC4")) +
+	scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.5)) +
+	facet_grid(concentration~time, scales = "free_y") +
+	coord_flip()
+```
+
+
+Example:
+```{r}
+net_e2f2 <- regulons %>% filter(tf == "E2F2") %>%
+	dplyr::rename(from = "tf", to = "target")
+
+net_e2f2_nodes <- tibble(id = unique(c(net_e2f2$from,net_e2f2$to))) %>%
+	mutate(label = id) %>%
+	#mutate(color = ifelse(id %in% net_e2f2$from, "red","green")) %>%
+	mutate(hgnc_symbol = id) %>%
+	left_join(filter(dorothea_data_hgnc,sample_id =="colon_1000uM_24h"), by= "hgnc_symbol") %>%
+	mutate(size = 5 + 5*(abs(log2FC) - min(abs(log2FC),na.rm = TRUE))) %>%
+	mutate(size = ifelse(is.na(size),5,size)) %>%
+	mutate(color = ifelse(is.na(log2FC), "grey", ifelse(sign(log2FC) == 1,"red","blue") ))
+
+
+visNetwork::visNetwork(nodes = net_e2f2_nodes,  edges = net_e2f2)%>% 
+	visNetwork::visEdges(arrows = 'to', scaling = list(min = 2, max = 2),color = "mor" )
+```
+
+```{r}
+net_e2f2 <- regulons %>% filter(tf == "NFE2L2") %>%
+	dplyr::rename(from = "tf", to = "target")
+
+net_e2f2_nodes <- tibble(id = unique(c(net_e2f2$from,net_e2f2$to))) %>%
+	mutate(label = id) %>%
+	#mutate(color = ifelse(id %in% net_e2f2$from, "red","green")) %>%
+	mutate(hgnc_symbol = id) %>%
+	left_join(filter(dorothea_data_hgnc,sample_id =="colon_1000uM_24h"), by= "hgnc_symbol") %>%
+	mutate(size = 5 + 5*(abs(log2FC) - min(abs(log2FC),na.rm = TRUE))) %>%
+	mutate(size = ifelse(is.na(size),5,size)) %>%
+	mutate(color = ifelse(is.na(log2FC), "grey", ifelse(sign(log2FC) == 1,"red","blue") ))
+
+
+visNetwork::visNetwork(nodes = net_e2f2_nodes,  edges = net_e2f2)%>% 
+	visNetwork::visEdges(arrows = 'to', scaling = list(min = 2, max = 2),color = "mor" )
+
+
+```
+
+
+
+
+We take the 5 top TF's from each conditions and check which are the genes that were used 
+to determine their activities: 
+
+```{r Volcano, warning=FALSE, dpi=300, fig.width=15, fig.height=15}
+top_5_tf = tf_activities %>%
+	group_by(sample) %>%
+	top_n(5, wt = abs(activity)) %>%
+	arrange(activity) %>% pull(tf) %>% unique()
+
+regulons %>% 
+	filter(tf %in% top_5_tf) %>%
+	inner_join(dorothea_data %>% rename(target = hgnc_symbol),by = "target") %>%
+	left_join(sample_table, by = c("concentration", "time", "organ", "sample_id")) %>%
+	group_by(sample_id,tf) %>%
+	mutate(lfc_rank = n()-rank(abs(log2FoldChange))) %>% 
+	mutate(label = ifelse(padj<0.05 & lfc_rank<5, target, "" ) ) %>%
+	arrange(desc(abs(log2FoldChange))) %>%
+	
+	ggplot(aes(log2FoldChange,-log10(pvalue))) +
+	geom_point(aes(color=padj<0.05)) +
+	ggrepel::geom_text_repel(aes(label=label)) +
+	facet_grid(organ+concentration+time~tf)
+
+```
+
